@@ -3,9 +3,10 @@ const dotenv = require("dotenv");
 const mongoose = require("mongoose");
 const PayOS = require("@payos/node");
 const Payment = require("./models/Payment");
+const User = require("./models/User");
+const moment = require("moment-timezone");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 dotenv.config();
 
 mongoose
@@ -35,7 +36,7 @@ app.post("/create-payment-link", async (req, res) => {
     orderCode,
     amount,
     description,
-    cancelUrl: `${process.env.SERVER_URL}/cancel.html`,
+    cancelUrl: `${process.env.SERVER_URL}/cancel`,
     returnUrl: `${process.env.SERVER_URL}/success.html`,
   };
 
@@ -46,6 +47,17 @@ app.post("/create-payment-link", async (req, res) => {
     console.log("Payment Link Response:", paymentLinkResponse);
     const paymentUrl = paymentLinkResponse.checkoutUrl;
 
+    const payment = new Payment({
+      userId,
+      amount,
+      description,
+      orderCode,
+      paymentUrl,
+      status: "PENDING",
+    });
+    await payment.save();
+    console.log(`Payment ${orderCode} created with PENDING status`);
+
     res.json({ paymentUrl, orderCode });
   } catch (error) {
     console.error("Error creating payment link:", error.message);
@@ -55,32 +67,115 @@ app.post("/create-payment-link", async (req, res) => {
   }
 });
 
-app.get("/success", async (req, res) => {
-  const { orderCode } = req.query;
-
-  try {
-    const payment = new Payment({
-      userId: "unknown",
-      amount: 0,
-      description: "Thanh toán qua PayOS",
-      orderCode: Number(orderCode),
-      paymentUrl: `https://pay.payos.vn/${orderCode}`,
-      status: "SUCCESS",
-    });
-    await payment.save();
-
-    console.log(`Payment ${orderCode} saved to database`);
-    res.redirect("/success.html");
-  } catch (error) {
-    console.error("Error saving payment:", error.message);
-    res.status(500).send("Server error");
-  }
+app.get("/success", (req, res) => {
+  res.redirect("/success.html");
 });
 
-app.get("/cancel", (req, res) => {
+app.get("/cancel", async (req, res) => {
+  const { orderCode, status, cancel } = req.query;
+
+  console.log("Cancel query params:", req.query);
+
+  if (orderCode && cancel === "true" && status === "CANCELLED") {
+    try {
+      const payment = await Payment.findOneAndUpdate(
+        { orderCode: Number(orderCode), status: "PENDING" },
+        { status: "CANCELLED" },
+        { new: true }
+      );
+      if (payment) {
+        console.log(`Payment ${orderCode} updated to CANCELLED`);
+      } else {
+        console.log(`Payment ${orderCode} not found or already updated`);
+      }
+    } catch (error) {
+      console.error("Error updating payment to CANCELLED:", error.message);
+    }
+  } else {
+    console.log("Invalid cancel request or missing params");
+  }
+
   res.redirect("/cancel.html");
 });
 
-app.listen(PORT, () => {
-  console.log(`Payment server running on port ${PORT}`);
+app.post("/webhook", async (req, res) => {
+  const webhookData = req.body;
+  console.log("Webhook received:", webhookData);
+
+  try {
+    const verifiedData = payos.verifyPaymentWebhookData(webhookData);
+    console.log("Verified Webhook Data:", verifiedData);
+
+    if (
+      verifiedData.description === "VQRIO123" ||
+      verifiedData.orderCode === 123
+    ) {
+      console.log("This is a test webhook from PayOS, skipping processing");
+      return res.status(200).json({ success: true });
+    }
+
+    const orderCode = verifiedData.orderCode;
+    const paymentCode = verifiedData.code;
+
+    let status;
+    switch (paymentCode) {
+      case "00":
+        status = "SUCCESS";
+        break;
+      default:
+        status = "FAILED";
+        console.log("Unhandled payment code:", paymentCode);
+    }
+
+    const payment = await Payment.findOneAndUpdate(
+      { orderCode: Number(orderCode) },
+      { status, transactionId: verifiedData.reference || null },
+      { new: true }
+    );
+
+    if (!payment) {
+      console.error(`Payment ${orderCode} not found`);
+      return res.status(404).json({ error: "Payment not found" });
+    }
+
+    console.log(`Payment ${orderCode} updated to ${status}`);
+
+    if (status === "SUCCESS") {
+      try {
+        const expirationDate = moment()
+          .tz("Asia/Ho_Chi_Minh")
+          .add(1, "months")
+          .toDate();
+
+        const user = await User.findOneAndUpdate(
+          { userId: payment.userId },
+          {
+            userType: "premium",
+            premiumExpiration: expirationDate,
+          },
+          { new: true, upsert: true }
+        );
+        console.log(
+          `User ${payment.userId} updated to premium, expires on ${moment(
+            expirationDate
+          )
+            .tz("Asia/Ho_Chi_Minh")
+            .format("YYYY-MM-DD HH:mm:ss z")}`
+        );
+      } catch (error) {
+        console.error("Error updating user to premium:", error.message);
+      }
+    }
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error("Error processing webhook:", error.message);
+    res
+      .status(400)
+      .json({ error: "Invalid webhook data", details: error.message });
+  }
+});
+
+app.listen(process.env.PORT, () => {
+  console.log(`Payment server running on port ${process.env.PORT}`);
 });
